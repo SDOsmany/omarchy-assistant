@@ -83,10 +83,12 @@ For email and calendar, connect Gmail and Google Calendar at claude.ai → Setti
 omawake (wake word) ──► omarchy-assistant wake ──► assistantd (systemd user service)
                                                      ├─ records until you pause
                                                      ├─ Superwhisper / Whisper → text
-                                                     ├─ claude -p (persona + access level)
-                                                     ├─ Kokoro → speech, interruptible
+                                                     ├─ claude -p, streamed (persona + access level)
+                                                     ├─ Kokoro → speech, sentence by sentence
                                                      └─ state → bar widget
 ```
+
+It starts speaking as soon as the first phrase of the answer arrives: the answer streams in, is cut into sentences, and each sentence is turned into speech while the previous one plays.
 
 Interrupting uses PipeWire's WebRTC echo canceller on a separate virtual mic. On built-in laptop speakers the echo is too strong to cancel reliably, so it's only on automatically with headphones or external audio.
 

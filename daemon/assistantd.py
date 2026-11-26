@@ -13,6 +13,7 @@ The current state is mirrored to state.json in the same directory.
 
 import json
 import os
+import queue
 import re
 import signal
 import socket
@@ -149,6 +150,53 @@ def endings_for(name):
     return Matcher()
 
 
+_ABBREVIATIONS = {"mr", "mrs", "ms", "dr", "st", "vs", "etc", "e.g", "i.e", "jr", "sr",
+                  "approx", "inc", "ltd", "co", "mt", "ft", "u.s"}
+_BOUNDARY = re.compile(r"[.!?…][\"'”’)\]]*\s+|\n+")
+_CLAUSE = re.compile(r"[.!?…,;:—–][\"'”’)\]]*\s+|\n+")
+
+
+def split_sentences(buffer, final=False, min_chars=12, first=False):
+    """Cut complete sentences off the front of streamed text.
+
+    Returns (sentences, remainder). A sentence ends at . ! ? or … followed by
+    whitespace, or at a line break. Decimals ("3.8") never split, since there's no
+    space after the point; common abbreviations ("Dr. Smith") don't either. Very
+    short fragments are joined to the next sentence. With final=True the remainder
+    is returned as a last sentence.
+
+    With first=True (nothing spoken yet) it also cuts at a comma, semicolon,
+    colon or dash once there are 20 characters, and returns only that first
+    piece: a short opening phrase becomes speech sooner, and the rest is
+    synthesized while it plays."""
+    sentences, start, pos = [], 0, 0
+    pattern = _CLAUSE if first else _BOUNDARY
+    if first:
+        min_chars = max(min_chars, 20)
+    while True:
+        if first and sentences:
+            break
+        m = pattern.search(buffer, pos)
+        if not m:
+            break
+        piece = buffer[start:m.end()]
+        last_word = re.sub(r"[^\w.]", "", piece.strip().split()[-1].lower()).rstrip(".") if piece.strip() else ""
+        if m.group().startswith(".") and last_word in _ABBREVIATIONS:
+            pos = m.end()
+            continue
+        if len(piece.strip()) >= min_chars or m.group().startswith("\n"):
+            if piece.strip():
+                sentences.append(piece.strip())
+            start = m.end()
+        pos = m.end()
+    rest = buffer[start:]
+    if final:
+        if rest.strip():
+            sentences.append(rest.strip())
+        rest = ""
+    return sentences, rest
+
+
 def clean_for_speech(text):
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
     text = re.sub(r"https?://\S+", "", text)
@@ -187,6 +235,7 @@ class Assistant:
         self.lock = threading.Lock()
         self.cancel = threading.Event()
         self.proc = None
+        self.agent = None                    # the running agent process, killable by stop
         self.worker = None
         self.subscribers = []
         self.whisper = None
@@ -238,9 +287,9 @@ class Assistant:
 
     def stop(self):
         self.cancel.set()
-        p = self.proc
-        if p and p.poll() is None:
-            p.terminate()
+        for p in (self.proc, self.agent):
+            if p and p.poll() is None:
+                p.terminate()
         return {"ok": True}
 
     def set_muted(self, muted):
@@ -301,19 +350,14 @@ class Assistant:
                     break
                 self.set_state("thinking", heard)
                 self.notify(f"“{heard}”", 4000)
-                reply = self.ask(heard, resume)
-                log("reply:", reply)
+                interrupted, reply, done = self.respond(heard, resume)
+                log("reply:", reply, "(interrupted)" if interrupted else "")
                 resume = True
                 LAST_TURN.write_text(str(time.time()))
-                done = END_TOKEN in reply
-                reply = reply.replace(END_TOKEN, "").strip()
                 if reply:
                     self.notify(reply, 8000)
-                if done:                              # the agent says we're finished
-                    if reply:
-                        self.speak(reply)
+                if done and not interrupted:          # the agent says we're finished
                     break
-                interrupted = self.speak(reply, interruptible=True)
                 wait = self.cfg["followup_wait"]
             self.chime("end")
         except Cancelled:
@@ -477,12 +521,187 @@ class Assistant:
         return text
 
     # ---- agent ---------------------------------------------------------------
-    def ask(self, text, resume):
+    def respond(self, text, resume):
+        """Ask the agent and speak its answer while it streams in.
+
+        Three stages run at once: this thread plays audio (and listens for a
+        barge-in), a reader thread cuts the agent's streamed text into sentences,
+        and a synth thread turns each sentence into speech.
+        Returns (interrupted, reply, done): interrupted is (recorder, preroll) if
+        the user talked over it, reply is the full text without the end token,
+        and done is True when the agent ended the conversation."""
+        cmd = agent_command(self.cfg, text, resume) + [
+            "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+        agent = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True)
+        self.agent = agent
+        sentences, audio = queue.Queue(), queue.Queue()
+        abort = threading.Event()            # stops the helper threads early
+        tag = str(int(time.time() * 1000))   # unique file names per answer
+        for old in RUN.glob("reply-*.wav"):  # leftovers from interrupted answers
+            if old.stat().st_mtime < time.time() - 600:
+                old.unlink(missing_ok=True)
+        shared = {"text": "", "queued": 0}
+
+        def reader():
+            buf = ""
+            result = None
+            try:
+                for line in agent.stdout:
+                    if abort.is_set():
+                        break
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    kind = event.get("type")
+                    if kind == "result":
+                        result = event.get("result") or ""
+                        continue
+                    if kind != "stream_event":
+                        continue
+                    ev = event.get("event") or {}
+                    if ev.get("type") == "content_block_start" and \
+                            (ev.get("content_block") or {}).get("type") == "text":
+                        # a new text block (e.g. after a tool call): keep words apart
+                        if shared["text"] and not shared["text"][-1].isspace():
+                            shared["text"] += " "
+                            buf += " "
+                    elif ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta") or {}
+                        if delta.get("type") != "text_delta":
+                            continue
+                        chunk = delta.get("text") or ""
+                        shared["text"] += chunk
+                        buf += chunk
+                        ready, buf = split_sentences(buf, first=shared["queued"] == 0)
+                        if ready and shared["queued"] == 0 and buf:
+                            more, buf = split_sentences(buf)        # whole sentences after it
+                            ready += more
+                        for s in ready:
+                            sentences.put(s)
+                            shared["queued"] += 1
+            except Exception as e:
+                log("reader error:", repr(e))
+            finally:
+                ready, _ = split_sentences(buf, final=True)
+                for s in ready:
+                    sentences.put(s)
+                    shared["queued"] += 1
+                if not shared["text"].strip() and result:   # no stream, but a final answer
+                    shared["text"] = result
+                    for s in split_sentences(result, final=True)[0]:
+                        sentences.put(s)
+                        shared["queued"] += 1
+                sentences.put(None)
+
+        def synth():
+            voice = self.cfg["voice"]
+            lang = "en-gb" if voice.startswith("b") else "en-us"
+            n = 0
+            try:
+                while not abort.is_set():
+                    s = sentences.get()
+                    if s is None:
+                        break
+                    s = clean_for_speech(s.replace(END_TOKEN, ""))
+                    if not s:
+                        continue
+                    samples, sr = self.tts.create(s, voice=voice, speed=self.cfg["speed"], lang=lang)
+                    path = RUN / f"reply-{tag}-{n}.wav"
+                    sf.write(str(path), samples, sr)
+                    n += 1
+                    if abort.is_set():            # stopped while this was being made
+                        path.unlink(missing_ok=True)
+                        break
+                    audio.put(path)
+            except Exception as e:
+                log("synth error:", repr(e))
+            finally:
+                audio.put(None)
+
+        threading.Thread(target=reader, daemon=True).start()
+        threading.Thread(target=synth, daemon=True).start()
+
+        barge = self.barge_in_enabled()
+        need = max(1, int(self.cfg.get("barge_in_ms", 300) / 30))
+        rec = player = playing = None
+        handed_off = False                    # rec was returned to the caller
+        spoke = False
+        frames, floor_samples, run, heard_for = [], [], 0, 0.0
+        deadline = time.time() + 300
         try:
-            out = self._run(agent_command(self.cfg, text, resume), timeout=300, cwd=WORKDIR)
-        except subprocess.TimeoutExpired:
-            return "That one took too long, so I stopped. Want me to try again?"
-        return out.strip() or "Sorry, I couldn't reach my brain just now."
+            while True:
+                self._check()
+                if player is not None and player.poll() is not None:
+                    playing.unlink(missing_ok=True)
+                    player = None
+                if player is None:
+                    try:
+                        path = audio.get(timeout=0.03)
+                    except queue.Empty:
+                        path = False
+                    if path is None:          # everything has been spoken
+                        break
+                    if path:
+                        if not spoke:
+                            spoke = True
+                            if barge:
+                                rec = self.recorder(self.barge_in_device())
+                        self.set_state("speaking", shared["text"])
+                        player = subprocess.Popen(["pw-play", str(path)], stdout=subprocess.DEVNULL,
+                                                  stderr=subprocess.DEVNULL)
+                        playing = path
+                        self.proc = player
+                    elif spoke and self.state == "speaking":
+                        self.set_state("thinking", shared["text"])   # e.g. running a tool mid-answer
+                    if time.time() > deadline:
+                        log("agent timed out")
+                        abort.set()
+                        if agent.poll() is None:
+                            agent.kill()
+                        shared["text"] += " That one took too long, so I stopped."
+                        break
+                if rec is not None:
+                    data = rec.stdout.read(CHUNK * 2)
+                    if not data:
+                        rec = None
+                        continue
+                    level = self.rms(data)
+                    heard_for += CHUNK / RATE
+                    frames = (frames + [data])[-20:]          # 600 ms of lead-in
+                    if heard_for < 0.3:
+                        floor_samples.append(level)
+                        continue
+                    floor = max(float(np.median(floor_samples)), 60.0)
+                    run = run + 1 if level > max(floor * 4.0, 500.0) else 0
+                    if run >= need:
+                        log("barge-in")
+                        handed_off = True
+                        reply = shared["text"].replace(END_TOKEN, "").strip()
+                        return (rec, frames), reply, False
+                elif player is not None:
+                    time.sleep(0.03)
+        finally:
+            abort.set()
+            if player is not None and player.poll() is None:
+                player.terminate()
+            for leftover in RUN.glob(f"reply-{tag}-*.wav"):
+                leftover.unlink(missing_ok=True)
+            if agent.poll() is None:          # interrupted or cancelled mid-answer
+                agent.terminate()
+            if rec is not None and not handed_off and rec.poll() is None:
+                rec.terminate()
+            self.agent = None
+            self.proc = None
+
+        reply = shared["text"]
+        done = END_TOKEN in reply
+        reply = reply.replace(END_TOKEN, "").strip()
+        if not spoke and not reply:
+            reply = "Sorry, I couldn't reach my brain just now."
+            self.speak(reply)
+        return None, reply, done
 
     # ---- text to speech ----------------------------------------------------------
     def speak(self, text, interruptible=False):
