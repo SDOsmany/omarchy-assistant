@@ -27,7 +27,7 @@ BarWidget {
     "idle": 0xF05CB,          // account-voice
     "listening": 0xF036C,     // microphone
     "transcribing": 0xF036C,
-    "thinking": 0xF0BEF,      // dots-horizontal-circle
+    "thinking": 0xF07C3,      // dots-horizontal-circle
     "speaking": 0xF057E,      // volume-high
     "muted": 0xF036D,         // microphone-off
     "offline": 0xF036D,

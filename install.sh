@@ -230,7 +230,8 @@ systemctl --user restart omawake
 ok "Listening for \"$name\""
 
 # ---- 9. echo cancellation (talk over it with headphones) --------------------------------
-if $aec && [[ ! -f $PW_DIR/60-omarchy-assistant-echo-cancel.conf ]]; then
+if $aec && [[ ! -f $PW_DIR/60-omarchy-assistant-echo-cancel.conf ]] &&
+  ask_confirm "Add an echo-cancelled mic so you can interrupt it with headphones? (restarts audio for a moment)" yes; then
   mkdir -p "$PW_DIR"
   cp "$APP/pipewire/60-omarchy-assistant-echo-cancel.conf" "$PW_DIR/"
   systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
