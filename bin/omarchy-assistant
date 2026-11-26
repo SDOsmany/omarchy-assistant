@@ -1,0 +1,82 @@
+#!/usr/bin/python3
+"""omarchy-assistant: control the Omarchy Assistant service."""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+APP = Path(__file__).resolve().parent.parent
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-assistant"
+SOCK = RUN / "assistant.sock"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-assistant/config.json"
+PROG = os.path.basename(sys.argv[0])
+
+USAGE = f"""usage: {PROG} <command>
+
+  talk          start a conversation now (same as saying the wake word)
+  toggle        talk, or stop if it's already busy
+  stop          stop listening, thinking or speaking
+  mute          stop listening for the wake word
+  unmute        listen for the wake word again
+  toggle-mute
+  say <text>    speak the text aloud
+  status        current state as JSON
+  watch         stream state changes as JSON lines
+  setup         run the setup wizard (name, voice, access, ...)
+  config        edit the config file
+  logs          follow the service log
+  restart       restart the service
+  uninstall     remove the service, models and settings
+"""
+
+
+def send(req, stream=False):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(str(SOCK))
+    except OSError:
+        if stream:
+            sys.exit(1)
+        sys.exit(f"{PROG}: the assistant isn't running. Set it up with: {PROG} setup")
+    s.sendall((json.dumps(req) + "\n").encode())
+    f = s.makefile("r")
+    if not stream:
+        print(f.readline(), end="")
+        return
+    try:
+        for line in f:
+            print(line, end="", flush=True)
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(USAGE, end="")
+        return
+    cmd, rest = args[0], args[1:]
+    if cmd == "setup":
+        os.execv(str(APP / "install.sh"), [str(APP / "install.sh"), *rest])
+    if cmd == "uninstall":
+        os.execv(str(APP / "uninstall.sh"), [str(APP / "uninstall.sh"), *rest])
+    if cmd == "logs":
+        os.execvp("journalctl", ["journalctl", "--user", "-u", "omarchy-assistant", "-f", "-n", "50"])
+    if cmd == "restart":
+        os.execvp("systemctl", ["systemctl", "--user", "restart", "omarchy-assistant"])
+    if cmd == "config":
+        editor = os.environ.get("EDITOR", "nvim")
+        subprocess.run([editor, str(CONFIG)])
+        return send({"cmd": "reload"})
+    if cmd == "watch":
+        return send({"cmd": "subscribe"}, stream=True)
+    if cmd == "say":
+        return send({"cmd": "say", "text": " ".join(rest)})
+    send({"cmd": cmd})
+
+
+if __name__ == "__main__":
+    main()

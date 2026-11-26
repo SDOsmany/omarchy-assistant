@@ -1,0 +1,10 @@
+{
+  "idle": "%1: say \"%1\" or click to talk",
+  "listening": "%1 is listening",
+  "transcribing": "%1 is catching that",
+  "thinking": "%1 is thinking",
+  "speaking": "%1 is speaking. Click to stop",
+  "muted": "%1 is muted. Right-click to unmute",
+  "offline": "Assistant isn't running. Click to start it",
+  "setup": "Set up your voice assistant"
+}

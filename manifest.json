@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.sdosmany.assistant",
+  "name": "Omarchy Assistant",
+  "version": "0.1.0",
+  "author": "SDOsmany",
+  "license": "MIT",
+  "description": "A voice assistant for Omarchy: say its name, ask anything, hear a natural voice answer. Wake word, conversation, interruptions, and optional full desktop control through Claude Code.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Assistant",
+    "description": "Shows what your voice assistant is doing. Click to talk or stop, right-click to mute, middle-click for the log.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=Omarchy Assistant (voice assistant)
+Documentation=https://github.com/SDOsmany/omarchy-assistant
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+Wants=omawake.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/omarchy-assistant/venv/bin/python @APP@/daemon/assistantd.py
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target
