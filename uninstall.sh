@@ -1,6 +1,6 @@
 #!/bin/bash
-# Remove Omarchy Assistant: service, wake word, shortcuts, echo-cancel mic, commands,
-# and (if you agree) the downloaded models and your settings.
+# Remove Omarchy Assistant: service, wake word, shortcuts, commands, the echo-cancel mic
+# older versions added, and (if you agree) the downloaded models and your settings.
 #   ./uninstall.sh [--yes]
 
 set -uo pipefail

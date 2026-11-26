@@ -5,7 +5,7 @@ A voice assistant for [Omarchy](https://omarchy.org). Say its name, ask anything
 - **Wake word you choose.** Call it Chloe, Jarvis, Friday, anything. No training needed.
 - **Natural voice.** [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) runs on your CPU, with 11 voices to choose from by ear during setup.
 - **Real conversations.** Ask follow-ups without repeating its name; it remembers the last few minutes.
-- **Interrupt it.** Talk over it with headphones and it stops to listen, like OpenAI's voice mode.
+- **Interrupt it.** Talk over it and it stops to listen, like OpenAI's voice mode: instantly with headphones, at its next pause on laptop speakers.
 - **Does things (optional).** With full access, it opens apps and sites, plays videos, reads your email and calendar, and runs commands, powered by [Claude Code](https://claude.com/claude-code).
 - **Lives in your bar.** An icon shows when it's listening, thinking or speaking.
 
@@ -75,7 +75,7 @@ For email and calendar, connect Gmail and Google Calendar at claude.ai → Setti
 | `followup_wait` | `8` | Seconds it waits for a follow-up |
 | `end_silence` | `1.2` | Pause, in seconds, that means you're done talking |
 | `continue_window` | `600` | Seconds within which it remembers the last conversation |
-| `barge_in` | `auto` | Talk over it: `auto` (not on built-in laptop speakers), `always`, `never` |
+| `barge_in` | `auto` | Talk over it to interrupt: `auto` or `never` |
 
 ## How it works
 
@@ -90,7 +90,7 @@ omawake (wake word) ──► omarchy-assistant wake ──► assistantd (syste
 
 It starts speaking as soon as the first phrase of the answer arrives: the answer streams in, is cut into sentences, and each sentence is turned into speech while the previous one plays.
 
-Interrupting uses PipeWire's WebRTC echo canceller on a separate virtual mic. On built-in laptop speakers the echo is too strong to cancel reliably, so it's only on automatically with headphones or external audio.
+To hear you over itself, it tracks how loud each word it plays is. With headphones it can hear you any time. On speakers its own voice reaches the mic about as loud as yours, so it listens for you in the pauses between its words and sentences, usually within a second or two of you starting to talk.
 
 ## Remove
 
@@ -99,7 +99,7 @@ omarchy-assistant uninstall
 omarchy plugin remove io.github.sdosmany.assistant
 ```
 
-This removes the service, wake word, shortcuts and echo-cancel mic, and asks before deleting models and settings.
+This removes the service, wake word and shortcuts, and asks before deleting models and settings.
 
 ## Develop
 

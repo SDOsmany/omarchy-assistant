@@ -5,7 +5,7 @@
 #   ./install.sh --yes [opts]    unattended, defaults for anything not given
 #
 # Options: --name NAME  --voice VOICE  --stt superwhisper|whisper  --access safe|full
-#          --model sonnet|opus|haiku  --talk-key "SUPER + ALT + A"  --no-keys  --no-echo-cancel
+#          --model sonnet|opus|haiku  --talk-key "SUPER + ALT + A"  --no-keys
 
 set -euo pipefail
 
@@ -15,7 +15,6 @@ DATA="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-assistant"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-assistant"
 CONF="$CONF_DIR/config.json"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-PW_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pipewire/pipewire.conf.d"
 BINDINGS="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/bindings.lua"
 BIN="$HOME/.local/bin"
 KOKORO_URL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
@@ -36,7 +35,7 @@ VOICES=(
   "bm_fable|Fable: storyteller (British, male)"
 )
 
-yes=false name="" voice="" stt="" access="" model="" talk_key="" keys=true aec=true
+yes=false name="" voice="" stt="" access="" model="" talk_key="" keys=true
 while (($#)); do
   case "$1" in
     --yes | -y) yes=true ;;
@@ -47,7 +46,6 @@ while (($#)); do
     --model) model=$2; shift ;;
     --talk-key) talk_key=$2; shift ;;
     --no-keys) keys=false ;;
-    --no-echo-cancel) aec=false ;;
     -h | --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -229,18 +227,7 @@ systemctl --user enable omawake >/dev/null 2>&1 || true
 systemctl --user restart omawake
 ok "Listening for \"$name\""
 
-# ---- 9. echo cancellation (talk over it with headphones) --------------------------------
-if $aec && [[ ! -f $PW_DIR/60-omarchy-assistant-echo-cancel.conf ]] &&
-  ask_confirm "Add an echo-cancelled mic so you can interrupt it with headphones? (restarts audio for a moment)" yes; then
-  mkdir -p "$PW_DIR"
-  cp "$APP/pipewire/60-omarchy-assistant-echo-cancel.conf" "$PW_DIR/"
-  systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
-  sleep 2
-  systemctl --user restart omawake 2>/dev/null || true
-  ok "Echo-cancelled mic, so you can interrupt it"
-fi
-
-# ---- 10. service and command -------------------------------------------------------------
+# ---- 9. service and command -------------------------------------------------------------
 say_step "Starting the assistant"
 mkdir -p "$UNIT_DIR"
 sed "s|@APP@|$APP|g" "$APP/systemd/omarchy-assistant.service" >"$UNIT_DIR/omarchy-assistant.service"
@@ -256,7 +243,7 @@ else
   ok "Command: omarchy-assistant"
 fi
 
-# ---- 11. keybindings ---------------------------------------------------------------------
+# ---- 10. keybindings ---------------------------------------------------------------------
 if $keys && [[ -f $BINDINGS ]]; then
   existing=$(sed -n '/-- >>> omarchy-assistant/,/-- <<< omarchy-assistant/p' "$BINDINGS" | grep -o '"SUPER[^"]*"' | head -1 | tr -d '"' || true)
   talk_key=${talk_key:-${existing:-SUPER + ALT + A}}
@@ -276,7 +263,7 @@ EOF
   fi
 fi
 
-# ---- 12. bar widget ------------------------------------------------------------------------
+# ---- 11. bar widget ------------------------------------------------------------------------
 plugins="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins"
 if [[ $APP != "$plugins/"* && ! -e $plugins/$PLUGIN_ID ]]; then
   mkdir -p "$plugins"

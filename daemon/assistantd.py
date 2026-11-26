@@ -53,14 +53,30 @@ DEFAULTS = {
     "end_silence": 1.2,
     "max_utterance": 40.0,
     "continue_window": 600,
-    "barge_in": "auto",              # auto: only off the built-in speakers | always | never
-    "barge_in_ms": 300,
+    "barge_in": "auto",              # auto | never: talk over it to interrupt
 }
 
 RATE = 16000
 CHUNK = 480                          # 30 ms
-AEC_SOURCE = "omarchy_assistant_aec"
-SPEAKER_SINKS = ("j313", "speaker")
+# Talking over the assistant. On speakers her voice reaches the mic as loud as yours,
+# so you're only heard in her pauses: a frame counts as a pause when nothing she
+# played from GAP_BACK frames before it to GAP_FWD - 1 frames after it was louder
+# than GAP_LEVEL.
+# Tuned on a MacBook's built-in speakers: her echo during pauses peaked at 315,
+# a person talking measured 400-1,100.
+GAP_BACK, GAP_FWD, GAP_LEVEL = 6, 2, 100.0
+VOICE_LEVEL = 500.0              # minimum mic level that can be the user
+BARGE_HITS, BARGE_SPAN = 4, 1.5  # that many voice frames within this many seconds
+# Sentences are synthesized one by one, so the pauses a single synthesis would have
+# between them are put back: natural, and the moments she can hear you on speakers.
+SENTENCE_PAUSE, CLAUSE_PAUSE = 0.40, 0.15   # seconds of silence before the next piece
+
+
+def pause_before(previous):
+    """Silence to put before the next piece, given the text of the previous one."""
+    if previous is None:
+        return 0.0
+    return CLAUSE_PAUSE if previous.rstrip()[-1:] in ",;:—–" else SENTENCE_PAUSE
 STATES = ("idle", "listening", "transcribing", "thinking", "speaking")
 
 PERSONA = """You are {name}, a voice assistant on the user's Omarchy Linux desktop \
@@ -219,6 +235,55 @@ def agent_command(cfg, text, resume):
     if resume:
         cmd.insert(1, "--continue")
     return cmd
+
+
+def loudness_envelope(samples, sr):
+    """Per-30 ms loudness of audio she's about to play, on the mic's int16 scale."""
+    frame = max(1, int(sr * 0.03))
+    n = len(samples) // frame
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    x = np.asarray(samples[:n * frame], dtype=np.float32).reshape(n, frame) * 32768.0
+    return np.sqrt(np.mean(x ** 2, axis=1))
+
+
+class BargeGate:
+    """Decides when the user is talking over the assistant.
+
+    feed() takes one 30 ms mic level and the loudness of what she was playing
+    around that moment. With echo-free output (headphones) every frame counts;
+    on speakers only her pauses do. Fires after BARGE_HITS voice frames within
+    BARGE_SPAN seconds."""
+
+    def __init__(self, echo_free):
+        self.echo_free = echo_free
+        self.floor = 150.0
+        self.hits = []
+
+    def feed(self, level, playing_level, now):
+        pause = self.echo_free or playing_level < GAP_LEVEL
+        if pause and level < self.floor * 2:
+            self.floor = 0.95 * self.floor + 0.05 * level
+        voice = pause and level > max(self.floor * 4.0, VOICE_LEVEL)
+        self.hits = [t for t in self.hits if now - t < BARGE_SPAN] + ([now] if voice else [])
+        return len(self.hits) >= BARGE_HITS
+
+
+class PlaybackTrack:
+    """When each sentence started playing, and how loud it is at any moment."""
+
+    def __init__(self):
+        self.env, self.start = None, 0.0
+
+    def play(self, env, start):
+        self.env, self.start = env, start
+
+    def level(self, now):
+        if self.env is None:
+            return 0.0
+        i = int((now - self.start) / 0.03)
+        seg = self.env[max(0, i - GAP_BACK):max(0, min(len(self.env), i + GAP_FWD))]
+        return float(seg.max()) if seg.size else 0.0
 
 
 class Cancelled(Exception):
@@ -425,17 +490,19 @@ class Assistant:
         pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32)
         return float(np.sqrt(np.mean(pcm ** 2))) if len(pcm) else 0.0
 
-    def barge_in_enabled(self):
-        mode = self.cfg.get("barge_in", "auto")
-        if mode in ("always", "never"):
-            return mode == "always"
-        sink = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True).stdout.lower()
-        return bool(sink) and not any(s in sink for s in SPEAKER_SINKS)
-
-    @staticmethod
-    def barge_in_device():
-        sources = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True).stdout
-        return AEC_SOURCE if AEC_SOURCE in sources else None
+    def barge_in_mode(self):
+        """None when talking over her is off, else "headphones" or "speakers"."""
+        if self.cfg.get("barge_in", "auto") == "never":
+            return None
+        sink = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True).stdout.strip()
+        if sink.startswith("bluez"):
+            return "headphones"
+        sinks = subprocess.run(["pactl", "list", "sinks"], capture_output=True, text=True).stdout
+        block = sinks.split(f"Name: {sink}", 1)[-1].split("\nSink #", 1)[0] if sink else ""
+        port = next((l.split(":", 1)[1].lower() for l in block.splitlines() if "Active Port:" in l), "")
+        if "headphone" in port or "headset" in port:
+            return "headphones"
+        return "speakers"
 
     def listen(self, wait, proc=None, preroll=None, ignore=0.0):
         """Record until the speaker pauses. Returns a WAV path, or None on silence.
@@ -599,6 +666,7 @@ class Assistant:
             voice = self.cfg["voice"]
             lang = "en-gb" if voice.startswith("b") else "en-us"
             n = 0
+            previous = None
             try:
                 while not abort.is_set():
                     s = sentences.get()
@@ -608,13 +676,17 @@ class Assistant:
                     if not s:
                         continue
                     samples, sr = self.tts.create(s, voice=voice, speed=self.cfg["speed"], lang=lang)
+                    gap = pause_before(previous)
+                    previous = s
+                    if gap:
+                        samples = np.concatenate([np.zeros(int(sr * gap), dtype=samples.dtype), samples])
                     path = RUN / f"reply-{tag}-{n}.wav"
                     sf.write(str(path), samples, sr)
                     n += 1
                     if abort.is_set():            # stopped while this was being made
                         path.unlink(missing_ok=True)
                         break
-                    audio.put(path)
+                    audio.put((path, loudness_envelope(samples, sr)))
             except Exception as e:
                 log("synth error:", repr(e))
             finally:
@@ -623,12 +695,14 @@ class Assistant:
         threading.Thread(target=reader, daemon=True).start()
         threading.Thread(target=synth, daemon=True).start()
 
-        barge = self.barge_in_enabled()
-        need = max(1, int(self.cfg.get("barge_in_ms", 300) / 30))
+        mode = self.barge_in_mode()
+        gate = BargeGate(echo_free=mode == "headphones") if mode else None
+        track = PlaybackTrack()
         rec = player = playing = None
         handed_off = False                    # rec was returned to the caller
         spoke = False
-        frames, floor_samples, run, heard_for = [], [], 0, 0.0
+        frames = []
+        rec_start, rec_chunks = 0.0, 0        # mic time comes from samples read, not wall clock
         deadline = time.time() + 300
         try:
             while True:
@@ -638,19 +712,23 @@ class Assistant:
                     player = None
                 if player is None:
                     try:
-                        path = audio.get(timeout=0.03)
+                        # while the mic is open, its reads pace this loop; never fall behind it
+                        item = audio.get_nowait() if rec is not None else audio.get(timeout=0.03)
                     except queue.Empty:
-                        path = False
-                    if path is None:          # everything has been spoken
+                        item = False
+                    if item is None:          # everything has been spoken
                         break
-                    if path:
+                    if item:
+                        path, env = item
                         if not spoke:
                             spoke = True
-                            if barge:
-                                rec = self.recorder(self.barge_in_device())
+                            if gate is not None:
+                                rec = self.recorder()
+                                rec_start = time.time()
                         self.set_state("speaking", shared["text"])
                         player = subprocess.Popen(["pw-play", str(path)], stdout=subprocess.DEVNULL,
                                                   stderr=subprocess.DEVNULL)
+                        track.play(env, time.time())
                         playing = path
                         self.proc = player
                     elif spoke and self.state == "speaking":
@@ -667,16 +745,11 @@ class Assistant:
                     if not data:
                         rec = None
                         continue
-                    level = self.rms(data)
-                    heard_for += CHUNK / RATE
+                    rec_chunks += 1
+                    now = rec_start + rec_chunks * CHUNK / RATE   # when this audio was captured
                     frames = (frames + [data])[-20:]          # 600 ms of lead-in
-                    if heard_for < 0.3:
-                        floor_samples.append(level)
-                        continue
-                    floor = max(float(np.median(floor_samples)), 60.0)
-                    run = run + 1 if level > max(floor * 4.0, 500.0) else 0
-                    if run >= need:
-                        log("barge-in")
+                    if gate.feed(self.rms(data), track.level(now), now):
+                        log("barge-in", f"({mode})")
                         handed_off = True
                         reply = shared["text"].replace(END_TOKEN, "").strip()
                         return (rec, frames), reply, False
@@ -704,8 +777,8 @@ class Assistant:
         return None, reply, done
 
     # ---- text to speech ----------------------------------------------------------
-    def speak(self, text, interruptible=False):
-        """Say text. Returns (recorder, preroll) if the user talked over it, else None."""
+    def speak(self, text):
+        """Say text, start to finish (stop() can cut it off)."""
         self._check()
         self.set_state("speaking", text)
         voice = self.cfg["voice"]
@@ -713,44 +786,7 @@ class Assistant:
                                       lang="en-gb" if voice.startswith("b") else "en-us")
         path = RUN / "reply.wav"
         sf.write(str(path), samples, sr)
-        if not (interruptible and self.barge_in_enabled()):
-            self._run(["pw-play", str(path)])
-            return None
-
-        player = subprocess.Popen(["pw-play", str(path)], stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-        rec = self.recorder(self.barge_in_device())
-        self.proc = player
-        need = max(1, int(self.cfg.get("barge_in_ms", 300) / 30))
-        frames, floor_samples, run, elapsed = [], [], 0, 0.0
-        try:
-            while player.poll() is None:
-                if self.cancel.is_set():
-                    player.terminate()
-                    raise Cancelled()
-                data = rec.stdout.read(CHUNK * 2)
-                if not data:
-                    break
-                elapsed += CHUNK / RATE
-                level = self.rms(data)
-                frames = (frames + [data])[-20:]      # 600 ms of lead-in
-                if elapsed < 0.3:
-                    floor_samples.append(level)
-                    continue
-                floor = max(float(np.median(floor_samples)), 60.0)
-                run = run + 1 if level > max(floor * 4.0, 500.0) else 0
-                if run >= need:
-                    log("barge-in")
-                    player.terminate()
-                    player.wait()
-                    return rec, frames
-        except Exception:
-            rec.terminate()
-            raise
-        rec.terminate()
-        rec.wait()
-        self._check()
-        return None
+        self._run(["pw-play", str(path)])
 
     # ---- socket server ---------------------------------------------------------
     def handle(self, conn):

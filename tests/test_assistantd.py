@@ -127,6 +127,69 @@ class SentenceSplitting(unittest.TestCase):
                          ["First thing here", "Second thing"])
 
 
+class TalkingOverHer(unittest.TestCase):
+    def feed(self, gate, frames, start=0.0):
+        """frames: (mic level, her playing level) pairs, 30 ms apart. Returns the
+        index of the frame that fired, or None."""
+        for i, (level, playing) in enumerate(frames):
+            if gate.feed(level, playing, start + i * 0.03):
+                return i
+        return None
+
+    def test_speakers_ignore_her_own_echo(self):
+        gate = a.BargeGate(echo_free=False)
+        frames = [(7800, 4000), (6500, 3500), (300, 2000), (5000, 4500)] * 100   # 12 s of her talking
+        self.assertIsNone(self.feed(gate, frames))
+
+    def test_speakers_hear_you_in_her_pauses(self):
+        gate = a.BargeGate(echo_free=False)
+        quiet = [(80, 0)] * 30                                   # room noise, she's silent
+        talking = [(6000, 4000)] * 10 + [(900, 20)] * 5          # her word, then a pause with you in it
+        fired = self.feed(gate, quiet + talking)
+        self.assertEqual(fired, 30 + 10 + 3)                     # 4th voice frame in her pause
+
+    def test_one_blip_is_not_enough(self):
+        gate = a.BargeGate(echo_free=False)
+        frames = ([(80, 0)] * 20 + [(2000, 0)] + [(80, 0)] * 40) * 5   # a click every 1.8 s
+        self.assertIsNone(self.feed(gate, frames))
+
+    def test_headphones_hear_you_while_she_talks(self):
+        gate = a.BargeGate(echo_free=True)
+        frames = [(80, 4000)] * 30 + [(900, 4000)] * 5
+        self.assertEqual(self.feed(gate, frames), 33)
+
+    def test_quiet_speech_below_voice_level_is_ignored(self):
+        gate = a.BargeGate(echo_free=True)
+        self.assertIsNone(self.feed(gate, [(80, 0)] * 30 + [(400, 0)] * 30))
+
+    def test_playback_level_window(self):
+        track = a.PlaybackTrack()
+        self.assertEqual(track.level(5.0), 0.0)                  # nothing played yet
+        env = a.np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3000, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=float)
+        track.play(env, 100.0)
+        at = lambda frame: track.level(100.0 + 0.03 * frame + 0.001)   # middle-ish of a frame
+        self.assertEqual(at(5), 0.0)                             # well before the loud frame
+        self.assertEqual(at(8), 0.0)
+        self.assertEqual(at(9), 3000.0)                          # one frame ahead: it's coming up
+        self.assertEqual(at(16), 3000.0)                         # 6 frames on: echo may still arrive
+        self.assertEqual(at(17), 0.0)                            # past the echo window
+        self.assertEqual(track.level(100.0 + 10), 0.0)           # long after it ended
+
+    def test_pauses_between_pieces(self):
+        self.assertEqual(a.pause_before(None), 0.0)                       # first piece: no delay
+        self.assertEqual(a.pause_before("Octopuses have three hearts,"), a.CLAUSE_PAUSE)
+        self.assertEqual(a.pause_before("Their blood is blue."), a.SENTENCE_PAUSE)
+        self.assertEqual(a.pause_before("Really?"), a.SENTENCE_PAUSE)
+
+    def test_loudness_envelope(self):
+        sr = 24000
+        t = a.np.arange(sr) / sr
+        env = a.loudness_envelope(0.5 * a.np.sin(2 * a.np.pi * 220 * t), sr)
+        self.assertEqual(len(env), 33)                           # 30 ms frames in 1 s
+        self.assertAlmostEqual(float(env[10]), 0.5 / 2 ** 0.5 * 32768, delta=200)
+        self.assertEqual(len(a.loudness_envelope(a.np.zeros(10), sr)), 0)
+
+
 class SpeechCleanup(unittest.TestCase):
     def test_strips_markdown_and_urls(self):
         out = a.clean_for_speech("**Done.** See https://example.com\n- one\n- two `x`")
