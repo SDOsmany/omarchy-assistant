@@ -71,6 +71,7 @@ For email and calendar, connect Gmail and Google Calendar at claude.ai → Setti
 | `stt` | `superwhisper` | `superwhisper` or `whisper` (local) |
 | `model` | `sonnet` | Claude model: `haiku` is faster, `opus` is smarter |
 | `access` | `safe` | `safe` or `full` |
+| `first_wait` | `10` | Seconds it waits for you to start talking after the chime |
 | `followup_wait` | `8` | Seconds it waits for a follow-up |
 | `end_silence` | `1.2` | Pause, in seconds, that means you're done talking |
 | `continue_window` | `600` | Seconds within which it remembers the last conversation |

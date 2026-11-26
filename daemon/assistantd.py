@@ -47,7 +47,7 @@ DEFAULTS = {
     "agent": "claude",
     "model": "sonnet",
     "access": "safe",                # safe: web only | full: everything, no prompts
-    "first_wait": 6.0,
+    "first_wait": 10.0,           # seconds to start talking after the chime
     "followup_wait": 8.0,
     "end_silence": 1.2,
     "max_utterance": 40.0,
@@ -190,6 +190,7 @@ class Assistant:
         self.worker = None
         self.subscribers = []
         self.whisper = None
+        self.noise_floor = 150.0             # running estimate of room noise (RMS)
         log("loading voice", self.cfg["voice"])
         self.tts = Kokoro(str(VOICES / "kokoro-v1.0.onnx"), str(VOICES / "voices-v1.0.bin"))
         self._make_chimes()
@@ -263,7 +264,9 @@ class Assistant:
 
     # ---- conversation loop ---------------------------------------------------
     def _conversation(self):
-        subprocess.run(["omawake", "pause"], capture_output=True)  # don't wake ourselves
+        # Open the mic first; pause the wake word and play the chime alongside it.
+        rec = self.recorder()
+        subprocess.Popen(["omawake", "pause"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         endings = endings_for(self.cfg["name"])
         try:
             try:
@@ -278,9 +281,11 @@ class Assistant:
                     audio = self.listen(wait, *interrupted)
                     interrupted = None
                 else:
-                    self.chime("start")
+                    rec = rec or self.recorder()
+                    self.chime("start", wait=False)
                     self.set_state("listening")
-                    audio = self.listen(wait)
+                    audio = self.listen(wait, proc=rec, ignore=0.25)
+                    rec = None
                 if audio is None:
                     break
                 self.set_state("transcribing")
@@ -322,6 +327,8 @@ class Assistant:
             except Exception:
                 pass
         finally:
+            if rec is not None and rec.poll() is None:
+                rec.terminate()
             self.proc = None
             self.set_state("idle")
             if not self.muted:
@@ -355,8 +362,11 @@ class Assistant:
                 w.setframerate(22050)
                 w.writeframes((audio * 0.35 * 32767).astype(np.int16).tobytes())
 
-    def chime(self, kind):
-        subprocess.run(["pw-play", str(RUN / f"{kind}.wav")], capture_output=True)
+    def chime(self, kind, wait=True):
+        p = subprocess.Popen(["pw-play", str(RUN / f"{kind}.wav")],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if wait:
+            p.wait()
 
     @staticmethod
     def recorder(device=None):
@@ -383,16 +393,14 @@ class Assistant:
         sources = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True).stdout
         return AEC_SOURCE if AEC_SOURCE in sources else None
 
-    def listen(self, wait, proc=None, preroll=None):
+    def listen(self, wait, proc=None, preroll=None, ignore=0.0):
         """Record until the speaker pauses. Returns a WAV path, or None on silence.
 
         With proc/preroll (after a barge-in) the user is already mid-sentence: keep
         recording on that stream, starting from the audio that interrupted."""
         self.proc = proc or self.recorder()
-        frames, floor_samples = list(preroll or []), []
+        frames = list(preroll or [])
         started, silent_for, elapsed = bool(preroll), 0.0, 0.0
-        if started:
-            floor_samples, elapsed = [100.0], 0.3
         step = CHUNK / RATE
         try:
             while True:
@@ -403,15 +411,16 @@ class Assistant:
                 level = self.rms(data)
                 elapsed += step
                 frames.append(data)
-                if elapsed < 0.3:                     # learn the room's noise floor
-                    floor_samples.append(level)
-                    continue
-                floor = max(float(np.median(floor_samples)) if floor_samples else 100.0, 60.0)
+                # The room's noise floor, kept across conversations and tracked on quiet
+                # frames only, so there's no dead time spent measuring it.
+                if level < self.noise_floor * 2.0:
+                    self.noise_floor = 0.95 * self.noise_floor + 0.05 * level
+                floor = max(self.noise_floor, 60.0)
                 speaking = level > max(floor * 3.0, 350.0)
                 if not started:
-                    if speaking:
+                    if speaking and elapsed > ignore:  # ignore the chime's own sound
                         started = True
-                    elif elapsed > wait:
+                    elif elapsed > wait + ignore:
                         return None
                     frames = frames[-10:]             # keep 300 ms of lead-in
                     continue
