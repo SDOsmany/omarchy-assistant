@@ -47,13 +47,22 @@ class AgentCommand(unittest.TestCase):
 class Endings(unittest.TestCase):
     def test_goodbyes_end_the_conversation(self):
         r = a.endings_for("Chloe")
-        for s in ("Thanks.", "thank you Chloe", "That's all", "okay, goodbye!", "Never mind"):
+        for s in ("Thanks.", "thank you Chloe", "That's all", "okay, goodbye!", "Never mind",
+                  "Nvm", "Nevermind.", "No, never mind.", "I don't need anything. Go away.",
+                  "Nah, I'm good.", "No thanks", "Oh, sorry, I wasn't talking to you.",
+                  "Forget it.", "I’m fine, thank you Chloe", "Not now."):
             self.assertTrue(r.match(s), s)
 
     def test_requests_do_not(self):
         r = a.endings_for("Chloe")
-        for s in ("Thanks, now open YouTube", "stop the music", "what's the weather"):
+        for s in ("Thanks, now open YouTube", "stop the music", "what's the weather",
+                  "Yes", "All right.", "No, open my email instead", "never mind that, play music",
+                  ""):
             self.assertFalse(r.match(s), s)
+
+    def test_persona_explains_end_token(self):
+        cmd = a.agent_command({**a.DEFAULTS, "name": "Chloe"}, "hi", False)
+        self.assertIn(a.END_TOKEN, cmd[cmd.index("--append-system-prompt") + 1])
 
     def test_name_with_regex_characters(self):
         self.assertTrue(a.endings_for("J.A.R.V.I.S").match("thanks j.a.r.v.i.s"))

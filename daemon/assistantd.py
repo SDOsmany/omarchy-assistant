@@ -68,7 +68,16 @@ PERSONA = """You are {name}, a voice assistant on the user's Omarchy Linux deskt
 Speaking: everything you write is read aloud by text-to-speech. Reply in one to three \
 short spoken sentences. No markdown, lists, code, URLs or emoji. Give the gist and offer \
 to go deeper.
+
+Ending: after you reply, the microphone opens again for a follow-up. If the user is \
+dismissing you or has nothing more to ask (for example "no", "all right", "I'm not", \
+"go away", "I don't need anything", a thank-you, or small talk with no request), reply \
+with at most a few words of sign-off, or nothing, and end your message with the exact \
+token {end}. Also end with {end} when you've fully answered and asked no question. Do \
+not invite more requests ("anything else?", "I'm here if you need me") when ending.
 """
+
+END_TOKEN = "<<END>>"
 
 FULL_ACCESS = """
 You have full control of this machine. Act, don't explain how: do the task with your \
@@ -110,13 +119,34 @@ def load_config():
     return cfg
 
 
+_FILLER = (r"oh|ah|uh|um|hmm|ok|okay|alright|all right|no|nah|nope|actually|sorry|well|"
+           r"yeah|yes|hey|so|just|then|please|you know")
+_DISMISS = (r"nvm|never ?mind|nothing|nothing else|forget it|forget about it|go away|"
+            r"i'?m good|i'?m fine|i'?m okay|i'?m ok|i'?m all set|i'?m done|we'?re done|all good|"
+            r"all set|not now|no thanks?|no thank you|thanks?|thank you|that'?s all|that'?s it|"
+            r"that will be all|that'?ll be all|i don'?t need anything|i don'?t need you|"
+            r"i don'?t need anything else|goodbye|good ?bye|bye|bye bye|good night|see you|"
+            r"see you later|later|stop|cancel|dismissed|shut up|be quiet|quiet|leave me alone|"
+            r"i was just testing|just testing|my bad|wrong person|not you|i wasn'?t talking to you")
+
+
 def endings_for(name):
-    n = re.escape(name.lower())
-    return re.compile(
-        rf"^\W*(?:ok(?:ay)?\W+)?(?:that'?s all|that will be all|goodbye|bye|good night|"
-        rf"never ?mind|stop|cancel|thanks?(?: you)?(?: {n})?|thank you(?: {n})?)\W*$",
-        re.I,
-    )
+    """A matcher for utterances that only dismiss the assistant ("no, never mind,
+    thanks Chloe"). Requests that merely start that way ("thanks, now open X") don't match."""
+    n = re.escape(re.sub(r"\s+", " ", re.sub(r"[^a-z' ]+", " ", name.lower())).strip())
+    piece = rf"(?:{_DISMISS}|{_FILLER}|{n}|hey {n})"
+    whole = re.compile(rf"^(?:{piece})(?: (?:{piece}))*$")
+    dismiss = re.compile(rf"(?:^| )(?:{_DISMISS})(?: |$)")
+
+    class Matcher:
+        @staticmethod
+        def match(text):
+            t = text.lower().replace("’", "'")
+            t = re.sub(r"[^a-z' ]+", " ", t)
+            t = re.sub(r"\s+", " ", t).strip()
+            return bool(t) and bool(whole.match(t)) and bool(dismiss.search(t))
+
+    return Matcher()
 
 
 def clean_for_speech(text):
@@ -129,7 +159,7 @@ def clean_for_speech(text):
 
 def agent_command(cfg, text, resume):
     """The argv for one agent turn."""
-    prompt = PERSONA.format(name=cfg["name"])
+    prompt = PERSONA.format(name=cfg["name"], end=END_TOKEN)
     prompt += FULL_ACCESS if cfg["access"] == "full" else SAFE_ACCESS
     prompt += "\nThe current date and time is " + time.strftime("%A, %B %-d, %Y, %-I:%M %p %Z") + "."
     cmd = ["claude", "-p", text, "--model", cfg["model"], "--append-system-prompt", prompt]
@@ -262,7 +292,7 @@ class Assistant:
                     continue
                 log("heard:", heard)
                 if endings.match(heard):
-                    self.speak("Anytime.")
+                    log("dismissed")
                     break
                 self.set_state("thinking", heard)
                 self.notify(f"“{heard}”", 4000)
@@ -270,7 +300,14 @@ class Assistant:
                 log("reply:", reply)
                 resume = True
                 LAST_TURN.write_text(str(time.time()))
-                self.notify(reply, 8000)
+                done = END_TOKEN in reply
+                reply = reply.replace(END_TOKEN, "").strip()
+                if reply:
+                    self.notify(reply, 8000)
+                if done:                              # the agent says we're finished
+                    if reply:
+                        self.speak(reply)
+                    break
                 interrupted = self.speak(reply, interruptible=True)
                 wait = self.cfg["followup_wait"]
             self.chime("end")
